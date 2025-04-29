@@ -1,0 +1,147 @@
+From 9f1c2d3 Mon Apr 29 00:00:00 2025
+From: Your Name <you@example.com>
+Date: Tue, 29 Apr 2025 12:00:00 +0000
+Subject: [PATCH] Robust JSON, fallback diversity, code-change tracking & feedback
+
+---
+ llm_interface.py      |  8 +++++++-
+ initial_code.py       | 27 +++++++++++++++++++++++++++
+ agent.py              | 28 ++++++++++++++++++++++++++---
+ 3 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/llm_interface.py b/llm_interface.py
+index abcdef0..1234567 100644
+--- a/llm_interface.py
++++ b/llm_interface.py
+@@ -210,7 +210,14 @@ class OllamaInterface(LLMInterface):
+             raw_response = ...  # existing code
+             cleaned_response = self._strip_think_tags(raw_response)
+ 
+-            # now parse cleaned_response into JSON...
++            # --- NEW: Pre-sanitization ---
++            # Fix common JSON formatting issues from LLM
++            sanitized = cleaned_response.replace("'", '"').strip()
++            # If additional escaping is needed, uncomment:
++            # sanitized = sanitized.replace("\\", "\\\\")
++            cleaned_response = sanitized
++            # --- END Pre-sanitization ---
++
++            # now parse cleaned_response into JSON...
+             if use_native_json_mode:
+                 json_string_or_error = cleaned_response
+             else:
+diff --git a/initial_code.py b/initial_code.py
+index 7654321..fedcba9 100644
+--- a/initial_code.py
++++ b/initial_code.py
+@@ -1,6 +1,7 @@
+ """Initial code for decision logic, shipped as a string."""
++import random  # Added for fallback diversity
+ 
+ INITIAL_DECISION_CODE = """
+ import logging
+@@ -120,6 +121,26 @@ def make_decision(prompt_context: str, llm_interface) -> List[Dict[str, Any]]:
+     # Handle LLM error strings
+     if isinstance(response, str) and response.startswith("Error:"):
+         llm_query_failed = True; llm_error_msg = response
++
++    # --- FIX 6: Schema Key Alias Recovery ---
++    # If LLM returned a dict with a list under an unexpected key, remap it
++    if isinstance(response, dict):
++        for key in ("tool_calls","tools","actions","action_list"):
++            if isinstance(response.get(key), list):
++                logger_decision.warning(f"LLM returned dict with list under key '{key}'. Using that list.")
++                raw_calls_to_process = response[key]
++                break
++        else:
++            raw_calls_to_process = [response]
++    else:
++        raw_calls_to_process = response if isinstance(response, list) else [response]
++    # --- END FIX 6 ---
+ 
+     # Validate structure of items found
+     structurally_valid_calls = [call for call in raw_calls_to_process if is_valid_tool_call_structure(call)]
+@@ -151,7 +172,24 @@ def make_decision(prompt_context: str, llm_interface) -> List[Dict[str, Any]]:
+         final_tool_calls_list = []  # will be filled by fallback
+ 
+     if llm_query_failed:
+-        final_tool_calls_list = [{"tool_name":"self_inspect","params":{}},{"tool_name":"evaluate","params":{}}]
++        logger_decision.warning(f"Using fallback logic: {llm_error_msg}")
++        # --- FIX 3: Fallback Diversity ---
++        fallback_templates = [
++            [{"tool_name":"self_inspect","params":{}},{"tool_name":"evaluate","params":{}}],
++            [{"tool_name":"analyze_failures","params":{}},{"tool_name":"evaluate","params":{}}]
++        ]
++        # choose strategy based on whether there was an error last iteration
++        if last_error_from_state:
++            final_tool_calls_list = fallback_templates[1]
++            logger_decision.info("Fallback strategy: analyze_failures + evaluate")
++        else:
++            final_tool_calls_list = random.choice(fallback_templates)
++            logger_decision.info(f"Fallback strategy selected: {[t['tool_name'] for t in final_tool_calls_list]}")
++        # --- END FIX 3 ---
+     else:
+         # existing param‐validation logic...
+         ...
+diff --git a/agent.py b/agent.py
+index 2468ace..13579bd 100644
+--- a/agent.py
++++ b/agent.py
+@@ -342,6 +342,12 @@ class SlimAgent:
+         for i in range(max_iterations):
+             logger.info(f"--- Starting Improvement Iteration: {i+1}/{max_iterations} ---")
+ 
++            # --- FIX 4: Track solver & decision logic code before iteration ---
++            prev_solver_code = self.state.get("solver_code")
++            prev_decision_code = self.state.get("decision_logic_code")
++            # --- END FIX 4 ---
++
+             # 1. Call decision logic to get tool_calls
+             decision_context_summary = self._get_state_summary_for_llm()
+             prompt_context_for_llm = f"{self.goal_prompt}\n\n## State:\n{json.dumps(decision_context_summary,indent=2)}"
+@@ -380,6 +386,17 @@ class SlimAgent:
+                     last_tool = {"tool_name":tool_name, "success":result.get("success"), "error":result.get("error")}
+ 
+             # --- FIX 4: Log code changes after tools ran ---
++            if prev_solver_code != self.state.get("solver_code"):
++                logger.info("Solver logic **changed** this iteration.")
++            else:
++                logger.info("Solver logic **unchanged** this iteration.")
++            if prev_decision_code != self.state.get("decision_logic_code"):
++                logger.info("Decision logic **changed** this iteration.")
++            else:
++                logger.info("Decision logic **unchanged** this iteration.")
++            # --- END FIX 4 ---
++
+             # 3. End iteration: calculate stagnation, log, possibly revert
+             score_after = self.state.get("score")
+ 
+@@ -392,6 +409,19 @@ class SlimAgent:
+             self.state['stagnation'] = new_stagnation
+ 
+             logger.info(f"--- End Iteration: {i+1} | Score: {self.state['score']} | Stagnation: {self.state['stagnation']} ---")
++
++            # --- FIX 5: Store last tool outcome & score delta for next iteration ---
++            score_before = decision_context_summary.get("score")
++            self.state["last_tool_outcome"] = {
++                "tool": last_tool.get("tool_name"),
++                "success": last_tool.get("success"),
++                "error": last_tool.get("error"),
++                "score_before": score_before,
++                "score_after": score_after,
++                "delta": (score_after - score_before) if isinstance(score_before,(int,float)) else None
++            }
++            # --- END FIX 5 ---
+ 
+         logger.info("--- Self-improvement loop finished. ---")
+         return
+@@ -128,7 +158,8 @@ class SlimAgent:
+     def _get_state_summary_for_llm(self) -> dict:
+         """Compile the pieces of state to send into the decision LLM."""
+         summary = {
+-            "score": self.state.get("score"), ...
++            "score": self.state.get("score"),
+             "iteration": self.state.get("iteration"), ...
++            "last_tool_outcome": self.state.get("last_tool_outcome"),
+         }
+         return summary
